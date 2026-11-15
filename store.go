@@ -2,9 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
-	"sync/atomic"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -73,13 +73,8 @@ type Store struct {
 	pods       map[string]*PodState
 	uidMap     map[string]string
 	queueTotal int
-	snap       atomic.Pointer[snapshot]
 
 	hub *Hub
-}
-
-type snapshot struct {
-	JSON []byte
 }
 
 func NewStore(hub *Hub) *Store {
@@ -136,8 +131,10 @@ func deriveState(pod *corev1.Pod, wl *WorkloadInfo) *PodState {
 		s.Phase = PhaseSucceeded
 	case corev1.PodFailed:
 		s.Phase = PhaseFailed
+		s.Error = postRunningError(pod)
 	case corev1.PodRunning:
 		s.Phase = PhaseRunning
+		s.Error = postRunningError(pod)
 	default:
 		if gated || wl == nil || !wl.Admitted {
 			s.Phase = PhaseQueued
@@ -208,7 +205,38 @@ func pendingError(pod *corev1.Pod) string {
 	return ""
 }
 
-func (st *Store) ApplyPod(pod *corev1.Pod) (*PodState, Counts, bool) {
+// postRunningError 提取运行中/运行后 Pod 的错误:容器等待原因(如
+// restartPolicy 非 Never 的外部 Pod 的 CrashLoopBackOff)、容器非零退出
+// (OOMKilled、业务进程报错)、Pod 级原因(如驱逐)。正常退出(exit 0)不算错误。
+func postRunningError(pod *corev1.Pod) string {
+	if len(pod.Status.ContainerStatuses) > 0 {
+		cs := pod.Status.ContainerStatuses[0]
+		if w := cs.State.Waiting; w != nil && errorWaitingReasons[w.Reason] && w.Message != "" {
+			return w.Reason + ": " + w.Message
+		}
+		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+			reason := t.Reason
+			if reason == "" {
+				reason = fmt.Sprintf("Exit code %d", t.ExitCode)
+			} else {
+				reason = fmt.Sprintf("%s (exit code %d)", reason, t.ExitCode)
+			}
+			if t.Message != "" {
+				return reason + ": " + t.Message
+			}
+			return reason
+		}
+	}
+	if pod.Status.Reason != "" && pod.Status.Reason != corev1.PodReasonUnschedulable {
+		if pod.Status.Message != "" {
+			return pod.Status.Reason + ": " + pod.Status.Message
+		}
+		return pod.Status.Reason
+	}
+	return ""
+}
+
+func (st *Store) ApplyPod(pod *corev1.Pod) (*PodState, bool) {
 	key := pod.Namespace + "/" + pod.Name
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -228,34 +256,32 @@ func (st *Store) ApplyPod(pod *corev1.Pod) (*PodState, Counts, bool) {
 		next.QueuePosition = old.QueuePosition
 	}
 	if old, existed := st.pods[key]; existed && *old == *next {
-		return nil, Counts{}, false
+		return nil, false
 	}
 	st.pods[key] = next
-	st.snap.Store(nil)
-	_, counts := st.listUnderLock(0)
-	return next, counts, true
+	return next, true
 }
 
-func (st *Store) ApplyWorkload(podUID string, info *WorkloadInfo) (*PodState, Counts, bool) {
+func (st *Store) ApplyWorkload(podUID string, info *WorkloadInfo) (*PodState, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	key, ok := st.uidMap[podUID]
 	if !ok {
-		return nil, Counts{}, false
+		return nil, false
 	}
 	return st.applyWorkloadLocked(key, info)
 }
 
-func (st *Store) ApplyWorkloadByKey(ns, name string, info *WorkloadInfo) (*PodState, Counts, bool) {
+func (st *Store) ApplyWorkloadByKey(ns, name string, info *WorkloadInfo) (*PodState, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.applyWorkloadLocked(ns+"/"+name, info)
 }
 
-func (st *Store) applyWorkloadLocked(key string, info *WorkloadInfo) (*PodState, Counts, bool) {
+func (st *Store) applyWorkloadLocked(key string, info *WorkloadInfo) (*PodState, bool) {
 	old, ok := st.pods[key]
 	if !ok {
-		return nil, Counts{}, false
+		return nil, false
 	}
 	next := *old
 	next.Workload = info.Name
@@ -277,41 +303,34 @@ func (st *Store) applyWorkloadLocked(key string, info *WorkloadInfo) (*PodState,
 		next.QueuePosition = QueuePositionUnknown
 	}
 	if *old == next {
-		return nil, Counts{}, false
+		return nil, false
 	}
 	st.pods[key] = &next
-	st.snap.Store(nil)
-	_, counts := st.listUnderLock(0)
-	return &next, counts, true
+	return &next, true
 }
 
-func (st *Store) DeletePod(namespace, name string) (Counts, bool) {
+func (st *Store) DeletePod(namespace, name string) bool {
 	key := namespace + "/" + name
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	pod, ok := st.pods[key]
 	if !ok {
-		return Counts{}, false
+		return false
 	}
 	if pod.UID != "" {
 		delete(st.uidMap, pod.UID)
 	}
 	delete(st.pods, key)
-	st.snap.Store(nil)
-	_, counts := st.listUnderLock(0)
-	return counts, true
+	return true
 }
 
 // ApplyQueuePositions updates the queue position of pending pods and the
 // total number of pending workloads in the ClusterQueue.
 // The map is keyed by "namespace/podName"; pods not present in the map
-// have their position reset to unknown. Returns the changed pods, the
-// current counts, and whether the total changed (positions may be
-// unchanged even when the total moved).
-func (st *Store) ApplyQueuePositions(positions map[string]int, total int) ([]*PodState, Counts, bool) {
+// have their position reset to unknown. Returns the changed pods.
+func (st *Store) ApplyQueuePositions(positions map[string]int, total int) []*PodState {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	totalChanged := st.queueTotal != total
 	st.queueTotal = total
 	var changed []*PodState
 	for key, pod := range st.pods {
@@ -327,12 +346,10 @@ func (st *Store) ApplyQueuePositions(positions map[string]int, total int) ([]*Po
 		st.pods[key] = &next
 		changed = append(changed, &next)
 	}
-	if len(changed) == 0 && !totalChanged {
-		return nil, Counts{}, false
+	if len(changed) == 0 {
+		return nil
 	}
-	st.snap.Store(nil)
-	_, counts := st.listUnderLock(0)
-	return changed, counts, totalChanged
+	return changed
 }
 
 func (st *Store) Get(namespace, name string) (*PodState, bool) {
@@ -378,31 +395,26 @@ func (st *Store) List(limit int) ([]*PodState, Counts) {
 	return st.listUnderLock(limit)
 }
 
-func (st *Store) SnapshotJSON(limit int) []byte {
-	if b := st.snap.Load(); b != nil {
-		return b.JSON
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if b := st.snap.Load(); b != nil {
-		return b.JSON
-	}
-	list, counts := st.listUnderLock(limit)
-	payload := struct {
-		Type   string      `json:"type"`
-		Pods   []*PodState `json:"pods"`
-		Counts Counts      `json:"counts"`
-	}{Type: "init", Pods: list, Counts: counts}
-	b, _ := json.Marshal(payload)
-	frame := sseFrame(b)
-	st.snap.Store(&snapshot{JSON: frame})
-	return frame
-}
-
 func sseFrame(b []byte) []byte {
 	out := make([]byte, 0, len(b)+8)
 	out = append(out, []byte("data: ")...)
 	out = append(out, b...)
 	out = append(out, '\n', '\n')
 	return out
+}
+
+// SnapshotJSONFor 返回只包含单个 Pod 的 init 帧(SSE 订阅按 Pod 过滤)。
+func (st *Store) SnapshotJSONFor(namespace, name string) []byte {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var pods []*PodState
+	if p, ok := st.pods[namespace+"/"+name]; ok {
+		pods = []*PodState{p}
+	}
+	payload := struct {
+		Type string      `json:"type"`
+		Pods []*PodState `json:"pods"`
+	}{Type: "init", Pods: pods}
+	b, _ := json.Marshal(payload)
+	return sseFrame(b)
 }

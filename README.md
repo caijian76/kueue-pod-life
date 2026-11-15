@@ -1,6 +1,6 @@
 # Kueue Pod 排队演示(k3s)
 
-Go Web 后端 + 内嵌前端页面:通过 API 在 k3s 上创建 Pod,由 **Kueue** 排队准入;前端页面实时跟踪 Pod 生命周期(创建 → 排队 → 准入 → 调度 → 拉取镜像 → 创建容器 → 运行),并显示排队原因。生命周期到"运行中"为止,之后的完成/失败状态不在跟踪范围内。
+Go Web 后端 + 内嵌前端页面:通过 API 在 k3s 上创建 Pod,由 **Kueue** 排队准入;前端页面实时跟踪 Pod 生命周期(创建 → 排队 → 准入 → 调度 → 拉取镜像 → 创建容器 → 运行),并显示排队原因。**每个页面只能创建一个 Pod 并只跟踪这一个 Pod 的状态**(按浏览器标签页隔离,刷新继续跟踪,删除后才能重新创建)。生命周期到"运行中"为止;运行之后再发生失败(OOMKilled、进程异常退出、驱逐等)仍会继续跟踪,以红色错误提示和红色状态灯显示。
 
 ## 架构
 
@@ -15,7 +15,7 @@ Go Web 后端 + 内嵌前端页面:通过 API 在 k3s 上创建 Pod,由 **Kueue*
 └──────────┘                  └─────────────────┘                └──────────────┘
 ```
 
-**Kueue 集成方式(Kueue v0.20 plain pods)**:后端创建的 Pod 带 `kueue.x-k8s.io/queue-name: user-queue` 标签;配额不足时 Kueue 给 Pod 加 `kueue.x-k8s.io/admission` scheduling gate(状态即"排队中"),并创建 Workload(`pod-<名字>-<hash>`,通过 ownerRef 关联 Pod);准入时移除 gate,Pod 进入调度。排队原因(如 `insufficient quota for cpu`)取自 Workload 的 `QuotaReserved` condition;**排队位置**通过 Kueue visibility 聚合 API(`/apis/visibility.kueue.x-k8s.io/v1beta2/clusterqueues/{cq}/pendingworkloads`,默认 5s 轮询,每次拉取该 ClusterQueue 的全部待处理 Workload)获取,前端显示"排队 N/M"(N=排队位置,M=当前总排队人数)。准入后调度失败(`Unschedulable`)、镜像拉取失败(`ErrImagePull`/`ImagePullBackOff`)等错误会以红色提示块显示在对应 Pod 卡片上。
+**Kueue 集成方式(Kueue v0.20 plain pods)**:后端创建的 Pod 带 `kueue.x-k8s.io/queue-name: user-queue` 标签;配额不足时 Kueue 给 Pod 加 `kueue.x-k8s.io/admission` scheduling gate(状态即"排队中"),并创建 Workload(`pod-<名字>-<hash>`,通过 ownerRef 关联 Pod);准入时移除 gate,Pod 进入调度。排队原因(如 `insufficient quota for cpu`)取自 Workload 的 `QuotaReserved` condition;**排队位置**通过 Kueue visibility 聚合 API(`/apis/visibility.kueue.x-k8s.io/v1beta2/clusterqueues/{cq}/pendingworkloads`,默认 5s 轮询,每次拉取该 ClusterQueue 的全部待处理 Workload)获取,前端显示"前方还有 N 人等待"(N=排队序号,队首为 1)。准入后调度失败(`Unschedulable`)、镜像拉取失败(`ErrImagePull`/`ImagePullBackOff`)、运行后失败(容器非零退出/`OOMKilled`/驱逐等,Pod 进入 `Failed`)等错误会以红色提示块和红色状态灯显示在对应 Pod 卡片上。
 
 ## 目录结构
 
@@ -44,7 +44,7 @@ go build -o pod-kueue-demo .
 ./pod-kueue-demo -kubeconfig /etc/rancher/k3s/k3s.yaml -addr :8080
 ```
 
-浏览器打开 `http://<节点IP>:8080` 即可使用。
+浏览器打开 `http://<节点IP>:8080` 即可使用。每个页面只能创建一个 Pod:提交后表单收起,页面只显示该 Pod 的实时状态;刷新页面继续跟踪同一个 Pod(基于 sessionStorage,每个标签页独立),删除该 Pod 后页面恢复为可创建状态。
 
 前提:Kueue 已安装且启用了 `pod` 集成(本机已具备:v0.20.5,`kueue-manager-config` 中 frameworks 含 `"pod"`),队列已存在:
 
@@ -75,17 +75,17 @@ kubectl apply -f deploy/02-deployment.yaml
 ./pod-kueue-demo -mock -mock-slots 2 -addr :8080
 ```
 
-内置模拟器复现 Kueue 生命周期:创建即排队(gated)→ 配额槽位(默认 2)有空时准入 → 调度 → 拉取镜像 → 创建容器 → 运行(常驻,与真实 `sleep infinity` 一致;准入后各阶段每 1s 推进一次)。镜像 tag 用 `error`(如 `busybox:error`)可模拟镜像拉取失败,演示错误提示。
+内置模拟器复现 Kueue 生命周期:创建即排队(gated)→ 配额槽位(默认 2)有空时准入 → 调度 → 拉取镜像 → 创建容器 → 运行(常驻,与真实 `sleep infinity` 一致;准入后各阶段每 1s 推进一次)。镜像 tag 用 `error`(如 `busybox:error`)可模拟镜像拉取失败,用 `crash`(如 `busybox:crash`)可模拟运行 5 秒后被 OOMKilled,演示错误提示。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/pods` | 创建 Pod。JSON:`{name?, namespace?, image, cpu?, memory?, queue?}`。name 留空自动生成;cpu 默认 100m;memory 默认 64Mi;启动命令固定为 `sleep infinity`(常驻);`terminationGracePeriodSeconds=0`(删除立即终止);queue 默认 `user-queue` |
+| POST | `/api/pods` | 创建 Pod。JSON:`{name?, namespace?, image, cpu?, memory?, queue?, command?, nodeSelector?}`。name 留空自动生成;cpu 默认 1(核);memory 默认 1Gi;command 留空则不设置 command(使用镜像默认入口),表单默认填 `sleep infinity`,支持引号包裹含空格参数;nodeSelector 可选,格式 `k1=v1,k2=v2`;`terminationGracePeriodSeconds=0`(删除立即终止);queue 默认 `user-queue` |
 | GET | `/api/pods?limit=300` | Pod 列表 + 各状态计数 |
 | GET | `/api/pods/{ns}/{name}` | 单个 Pod 状态 |
 | DELETE | `/api/pods/{ns}/{name}` | 删除 Pod |
-| GET | `/api/events` | SSE 实时事件流:`init` 全量快照,`update`/`delete` 差量事件 |
+| GET | `/api/events` | SSE 实时事件流。**必须带 `?pod=namespace/name`**:该连接只收到这个 Pod 的 `init` 单 Pod 快照和 `update`/`delete` 差量事件,后端不推送任何其它 Pod 的数据 |
 | GET | `/healthz` | 健康检查 + 连接数统计 |
 
 示例:
@@ -102,12 +102,12 @@ curl -X POST localhost:8080/api/pods -H 'Content-Type: application/json' \
 ## 并发效率设计(1000+ 前端)
 
 - **一条上游 watch**:所有浏览器共享同一对 informer(Pod + Workload)list/watch,后端与 apiserver 之间始终只有 2 条长连接,与前端人数无关。
-- **零轮询**:前端用 SSE(`EventSource`)长连接接收推送;每次变更只推该 Pod 的完整状态 + 全局计数,单条事件 < 1KB。
-- **预编码复用**:事件 JSON 每次变更只 marshal 一次,广播给 N 个连接时复用同一字节切片;快照(init)按版本缓存,重连客户端不触发重复计算。
+- **零轮询**:前端用 SSE(`EventSource`)长连接接收推送;每次变更只推该 Pod 的完整状态,单条事件 < 1KB。
+- **预编码复用**:事件 JSON 每次变更只 marshal 一次,推送给 N 个连接时复用同一字节切片;init 为单 Pod 实时构造的小帧,重连开销可忽略。
 - **慢客户端剔除**:每连接固定 256 条缓冲,写满立即断开(浏览器 `EventSource` 自动重连并重新拿全量快照),广播永不阻塞,慢用户不影响快用户。
 - **有界状态**:内存 store 按 key 索引 O(1) 读写;快照/列表上限默认 300 条,防止页面渲染退化(可调)。
-- **创建接口限流**:全局 50 QPS + 每 IP 2 QPS(突发 4),防止误用打爆 apiserver。
-- **无全局写超时**:SSE 连接不受 120s IdleTimeout 影响,15s 心跳保活穿透代理(`X-Accel-Buffering: no` 关闭缓冲)。
+- **创建接口限流**:全局 50 QPS(突发 100),防止误用打爆 apiserver。
+- **无全局写超时**:SSE 连接不受 120s IdleTimeout 影响,15s 心跳保活穿透代理(`X-Accel-Buffering: no` 关闭缓冲);update/delete 事件在 hub 内预编码为完整 SSE 帧(`data: ` 前缀 + 空行结尾,裸 JSON 会被浏览器 EventSource 静默忽略)。
 
 实测(本机,2 核 VM):**1000 个并发 SSE 连接**稳定保持,0 慢客户端丢弃,进程 CPU ~1%、内存 <1%。
 
@@ -115,7 +115,7 @@ curl -X POST localhost:8080/api/pods -H 'Content-Type: application/json' \
 
 ```bash
 # 1000 个并发 SSE 连接
-seq 1 1000 | xargs -P 1000 -I{} sh -c 'curl -sN -m 10 localhost:8080/api/events > /dev/null'
+seq 1 1000 | xargs -P 1000 -I{} sh -c 'curl -sN -m 10 "localhost:8080/api/events?pod=default/demo" > /dev/null'
 curl localhost:8080/healthz   # 查看 clients / droppedSlow
 ```
 
@@ -138,5 +138,5 @@ curl localhost:8080/healthz   # 查看 clients / droppedSlow
 ## 局限
 
 - 仅跟踪带 `kueue.x-k8s.io/queue-name` 标签或本服务创建的 Pod。
-- 排队位置与总排队人数来自 visibility API 轮询(默认 5s),瞬时变化可能有 ±1 个轮询周期的延迟。
+- 排队位置来自 visibility API 轮询(默认 5s),瞬时变化可能有 ±1 个轮询周期的延迟。
 - 前端单页最多渲染 `-max-snapshot` 条记录,更早的记录以计数汇总展示。

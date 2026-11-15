@@ -94,12 +94,9 @@ func (p *VisibilityPoller) pollOnce(ctx context.Context) error {
 		}
 		positions[it.Metadata.Namespace+"/"+podName] = it.PositionInClusterQueue
 	}
-	changed, counts, totalChanged := p.store.ApplyQueuePositions(positions, total)
+	changed := p.store.ApplyQueuePositions(positions, total)
 	for _, ps := range changed {
-		p.hub.PublishPodUpdate(ps, counts)
-	}
-	if totalChanged && len(changed) == 0 {
-		p.hub.PublishCounts(counts)
+		p.hub.PublishPodUpdate(ps)
 	}
 	return nil
 }

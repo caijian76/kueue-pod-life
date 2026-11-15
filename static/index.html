@@ -26,13 +26,9 @@
   .conn { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
   .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
-  .chip {
-    padding: 3px 10px; border-radius: 12px; border: 1px solid var(--border);
-    background: var(--panel); font-size: 12.5px; color: var(--muted);
-  }
-  .chip b { color: var(--text); margin-left: 4px; }
+  .dot.idle { background: var(--muted); }
   .wrap { display: grid; grid-template-columns: 320px 1fr; gap: 20px; padding: 20px 24px; max-width: 1400px; }
+  .wrap.solo { grid-template-columns: 1fr; max-width: 880px; margin: 0 auto; }
   @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
   .panel h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600; }
@@ -52,11 +48,14 @@
   .hint { margin-top: 10px; font-size: 12px; color: var(--muted); }
   .hint code { color: var(--purple); }
   .toast {
-    margin-top: 12px; padding: 8px 10px; border-radius: 6px; font-size: 12.5px;
-    display: none; word-break: break-all;
+    position: fixed; top: 64px; right: 24px; z-index: 30; max-width: 380px;
+    padding: 8px 12px; border-radius: 6px; font-size: 12.5px;
+    display: none; word-break: break-all; box-shadow: 0 4px 14px rgba(0,0,0,.45);
   }
   .toast.err { display: block; background: rgba(248,81,73,.15); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
   .toast.ok { display: block; background: rgba(63,185,80,.15); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+  .intro { color: var(--muted); font-size: 13px; line-height: 1.9; }
+  .intro b { color: var(--text); }
   .pods { display: flex; flex-direction: column; gap: 10px; }
   .empty { color: var(--muted); text-align: center; padding: 40px 0; }
   .pod { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
@@ -89,6 +88,9 @@
   .step.active .lb { color: var(--amber); }
   .step.ok .pt { background: var(--green); border-color: var(--green); }
   .step.ok .lb { color: var(--green); }
+  .step.err .pt { background: var(--red); border-color: var(--red); animation: pulseRed 1.2s infinite; }
+  .step.err .lb { color: var(--red); }
+  @keyframes pulseRed { 50% { box-shadow: 0 0 0 5px rgba(248,81,73,.2); } }
   @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(210,153,34,.2); } }
   .link { flex: 1 1 auto; height: 2px; background: var(--border); margin: 5px 2px 0; min-width: 8px; }
   .link.done { background: var(--blue); }
@@ -106,30 +108,26 @@
 <header>
   <h1>Kueue Pod 排队演示</h1>
   <div class="conn"><div class="dot" id="connDot"></div><span id="connText">连接中…</span></div>
-  <div class="chips">
-    <div class="chip">总计<b id="cTotal">0</b></div>
-    <div class="chip">排队<b id="cQueued">0</b></div>
-    <div class="chip">已准入<b id="cAdmitted">0</b></div>
-    <div class="chip">运行中<b id="cRunning">0</b></div>
-  </div>
 </header>
 
-<div class="wrap">
-  <aside class="panel">
+<div class="wrap" id="wrap">
+  <aside class="panel" id="formPanel">
     <h2>创建 Pod</h2>
     <form id="form">
       <label for="name">Pod 名称(留空自动生成)</label>
       <input id="name" placeholder="例如 web-demo-1" autocomplete="off" spellcheck="false">
       <label for="image">镜像</label>
       <input id="image" value="busybox:1.36" autocomplete="off" spellcheck="false">
+      <label for="command">启动命令(清空则用镜像默认入口)</label>
+      <input id="command" value="sleep infinity" autocomplete="off" spellcheck="false">
       <div class="grid2">
         <div>
           <label for="cpu">CPU 请求</label>
-          <input id="cpu" value="100m" autocomplete="off">
+          <input id="cpu" value="1" autocomplete="off">
         </div>
         <div>
           <label for="memory">内存请求</label>
-          <input id="memory" value="64Mi" autocomplete="off">
+          <input id="memory" value="1Gi" autocomplete="off">
         </div>
       </div>
       <div class="grid2">
@@ -142,29 +140,40 @@
           <input id="namespace" value="default" autocomplete="off" spellcheck="false">
         </div>
       </div>
+      <label for="nodeSelector">节点选择器(可选,格式 k1=v1,k2=v2)</label>
+      <input id="nodeSelector" placeholder="例如 kubernetes.io/os=linux" autocomplete="off" spellcheck="false">
       <button id="submit" type="submit">创建 Pod(经 Kueue 排队)</button>
-      <div class="toast" id="toast"></div>
       <div class="hint">
-        提交后 Pod 带上 <code>kueue.x-k8s.io/queue-name</code> 标签,
-        以 <code>sleep infinity</code> 常驻运行,由 Kueue 排队准入;
-        状态通过 SSE 实时推送,无需轮询。
+        每个页面只能创建一个 Pod。提交后 Pod 带上 <code>kueue.x-k8s.io/queue-name</code> 标签,
+        按启动命令常驻运行(默认 <code>sleep infinity</code>),由 Kueue 排队准入;状态通过 SSE 实时推送,无需轮询。
       </div>
     </form>
   </aside>
 
   <section>
-    <div class="pods" id="pods"><div class="empty">暂无 Pod,先创建一个试试</div></div>
+    <div class="panel" id="introPanel">
+      <h2>页面说明</h2>
+      <div class="intro">
+        每个页面只能创建 <b>一个</b> Pod,并只跟踪这一个 Pod 的状态:<br>
+        排队中(前方等待人数)→ 已准入 → 调度中 → 拉取镜像 → 创建容器 → 运行中。<br>
+        刷新页面后继续跟踪同一个 Pod;删除它之后,页面才会重新允许创建。
+      </div>
+    </div>
+    <div class="panel" id="trackPanel" hidden>
+      <h2>我的 Pod</h2>
+      <div class="pods" id="pods"></div>
+    </div>
   </section>
 </div>
+
+<div class="toast" id="toast"></div>
 
 <script>
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const pods = new Map();        // key -> pod state
-  const rows = new Map();        // key -> element
-  let rafPending = false;
-  let queueTotal = 0;            // ClusterQueue 当前排队总数(来自 visibility 轮询)
+  let trackedKey = sessionStorage.getItem('trackedPod') || '';  // 本页面跟踪的 Pod("ns/name")
+  let trackedPod = null;
 
   const PHASE_TEXT = {
     Queued: '排队中', Admitted: '已准入', Running: '运行中',
@@ -197,16 +206,39 @@
     $('connText').textContent = text;
   }
 
-  function updateCounts(c) {
-    if (!c) return;
-    queueTotal = c.queueTotal ?? 0;
-    $('cTotal').textContent = c.total ?? 0;
-    $('cQueued').textContent = c.queued ?? 0;
-    $('cAdmitted').textContent = c.admitted ?? 0;
-    $('cRunning').textContent = c.running ?? 0;
+  function setConnIdle(text) {
+    $('connDot').className = 'dot idle';
+    $('connText').textContent = text;
   }
 
-  // 每个节点状态:2=已完成 1=进行中 0=未开始 3=成功(生命周期到“运行中”为止)
+  function setView() {
+    const track = !!trackedKey;
+    $('formPanel').hidden = track;
+    $('introPanel').hidden = track;
+    $('trackPanel').hidden = !track;
+    $('wrap').classList.toggle('solo', track);
+  }
+
+  function setTracked(key) {
+    trackedKey = key;
+    trackedPod = null;
+    sessionStorage.setItem('trackedPod', key);
+    setView();
+    connect();
+    scheduleRender();
+  }
+
+  function clearTracked(msg) {
+    trackedKey = '';
+    trackedPod = null;
+    sessionStorage.removeItem('trackedPod');
+    setView();
+    connect();
+    scheduleRender();
+    if (msg) toast(msg, true);
+  }
+
+  // 每个节点状态:2=已完成 1=进行中 0=未开始 3=成功 4=失败
   function buildTimeline(p) {
     const labels = ['已创建', '排队中', '已准入', '调度中', '拉取镜像', '创建容器', '运行中'];
     const states = [2, 0, 0, 0, 0, 0, 0];
@@ -219,7 +251,7 @@
       states[5] = d === 'Creating' ? 1 : 0;
     } else if (p.phase !== 'Queued') {
       states[3] = states[4] = states[5] = 2;
-      states[6] = 3;
+      states[6] = p.phase === 'Failed' || (p.phase === 'Running' && p.error) ? 4 : 3;
     }
     const ts = [
       p.createdAt,
@@ -230,7 +262,7 @@
       '',
       p.startedAt,
     ];
-    const clsOf = s => s === 2 ? 'done' : s === 1 ? 'active' : s === 3 ? 'ok' : '';
+    const clsOf = s => s === 2 ? 'done' : s === 1 ? 'active' : s === 3 ? 'ok' : s === 4 ? 'err' : '';
     let html = '';
     for (let i = 0; i < labels.length; i++) {
       const cls = clsOf(states[i]);
@@ -255,9 +287,9 @@
     return `
       <div class="pod-head">
         <span class="pod-name">${esc(p.name)}</span>
-        <span class="badge ${esc(p.error && p.phase === 'Admitted' ? 'Failed' : p.phase)}">${DETAIL_TEXT[p.detail] || PHASE_TEXT[p.phase] || esc(p.rawPhase || p.phase)}</span>
+        <span class="badge ${esc(p.error && (p.phase === 'Admitted' || p.phase === 'Running') ? 'Failed' : p.phase)}">${DETAIL_TEXT[p.detail] || PHASE_TEXT[p.phase] || esc(p.rawPhase || p.phase)}</span>
         ${p.phase === 'Queued' && typeof p.queuePosition === 'number' && p.queuePosition >= 0
-          ? `<span class="pos">排队 ${p.queuePosition + 1}${queueTotal > 0 ? '/' + queueTotal : ''}</span>` : ''}
+          ? `<span class="pos">前方还有${p.queuePosition + 1}人等待</span>` : ''}
         <span class="pod-meta">
           <span>${esc(p.namespace)}</span>
           <button class="del" data-del="${esc(p.namespace)}/${esc(p.name)}">删除</button>
@@ -268,74 +300,60 @@
       <div class="pod-foot">${meta.join('')}</div>`;
   }
 
-  function sortedKeys() {
-    return [...pods.values()]
-      .sort((a, b) => (b.createdAt - a.createdAt) || (a.name < b.name ? 1 : -1))
-      .map(p => p.key);
-  }
-
   function render() {
-    rafPending = false;
+    if (!trackedKey) return;
     const container = $('pods');
-    for (const [k, el] of rows) {
-      if (!pods.has(k)) { el.remove(); rows.delete(k); }
-    }
-    const keys = sortedKeys();
-    if (!keys.length) {
-      if (!container.querySelector('.empty')) {
-        container.innerHTML = '<div class="empty">暂无 Pod,先创建一个试试</div>';
-      }
+    if (!trackedPod) {
+      container.innerHTML = '<div class="empty">正在获取 Pod 状态…</div>';
       return;
     }
-    const empty = container.querySelector('.empty');
-    if (empty) empty.remove();
-    let prev = null;
-    for (const k of keys) {
-      const p = pods.get(k);
-      let el = rows.get(k);
-      if (!el) {
-        el = document.createElement('div');
-        el.className = 'pod';
-        rows.set(k, el);
-      }
-      el.innerHTML = rowHTML(p);
-      if (!prev) container.prepend(el);
-      else prev.after(el);
-      prev = el;
-    }
+    container.innerHTML = `<div class="pod">${rowHTML(trackedPod)}</div>`;
   }
 
+  // 同步渲染:SSE 事件到达即在事件处理器内更新 DOM。
+  // 不能用 requestAnimationFrame —— 浏览器会暂停后台/被遮挡窗口的 rAF,
+  // 导致事件已到达但页面迟迟不重绘。
   function scheduleRender() {
-    if (rafPending) return;
-    rafPending = true;
-    requestAnimationFrame(render);
+    render();
   }
 
-  const es = new EventSource('/api/events');
-  es.onopen = () => setConn(true, '已连接(实时推送)');
-  es.onerror = () => setConn(false, '重连中…');
-  es.onmessage = ev => {
+  // 只订阅本页 Pod 的事件;未创建 Pod 时不建立连接,后端也只推送该 Pod 的数据
+  let es = null;
+  function connect() {
+    if (es) { es.close(); es = null; }
+    if (!trackedKey) {
+      setConnIdle('未创建 Pod');
+      return;
+    }
+    es = new EventSource('/api/events?pod=' + encodeURIComponent(trackedKey));
+    es.onopen = () => setConn(true, '已连接(实时推送)');
+    es.onerror = () => setConn(false, '重连中…');
+    es.onmessage = onEvent;
+  }
+
+  function onEvent(ev) {
     const m = JSON.parse(ev.data);
     if (m.type === 'init') {
-      pods.clear();
-      rows.forEach(el => el.remove());
-      rows.clear();
-      (m.pods || []).forEach(p => { p.key = p.namespace + '/' + p.name; pods.set(p.key, p); });
-      updateCounts(m.counts);
-    } else if (m.type === 'update') {
-      if (m.pod) {
-        m.pod.key = m.pod.namespace + '/' + m.pod.name;
-        pods.set(m.pod.key, m.pod);
+      if (trackedKey) {
+        if (Array.isArray(m.pods) && m.pods.length) {
+          trackedPod = m.pods[0];
+        }
       }
-      updateCounts(m.counts);
-    } else if (m.type === 'counts') {
-      updateCounts(m.counts);
-    } else if (m.type === 'delete') {
-      pods.delete(m.namespace + '/' + m.name);
-      updateCounts(m.counts);
+    } else {
+      if (m.type === 'update') {
+        if (m.pod && m.pod.namespace + '/' + m.pod.name === trackedKey) {
+          trackedPod = m.pod;
+        }
+      } else if (m.type === 'delete') {
+        if (m.namespace + '/' + m.name === trackedKey) {
+          clearTracked('Pod 已删除,可重新创建');
+        }
+      }
     }
     scheduleRender();
-  };
+  }
+
+  connect();
 
   $('form').addEventListener('submit', async e => {
     e.preventDefault();
@@ -345,6 +363,8 @@
       const body = {
         name: $('name').value.trim(),
         image: $('image').value.trim(),
+        command: $('command').value.trim(),
+        nodeSelector: $('nodeSelector').value.trim(),
         cpu: $('cpu').value.trim(),
         memory: $('memory').value.trim(),
         queue: $('queue').value.trim(),
@@ -358,8 +378,8 @@
       const data = await res.json();
       if (!res.ok) toast(data.error || `创建失败(HTTP ${res.status})`, false);
       else {
+        setTracked(data.namespace + '/' + data.name);
         toast(`已提交:${data.namespace}/${data.name},进入队列 ${data.queue}`, true);
-        $('name').value = '';
       }
     } catch (err) {
       toast('请求失败:' + err.message, false);
@@ -372,14 +392,23 @@
     const btn = e.target.closest('[data-del]');
     if (!btn) return;
     const key = btn.getAttribute('data-del');
+    if (key !== trackedKey) return;
     if (!confirm('删除 ' + key + ' ?')) return;
     const [ns, name] = key.split('/');
-    const res = await fetch(`/api/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`, { method: 'DELETE' });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      toast(data.error || '删除失败', false);
+    try {
+      const res = await fetch(`/api/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (res.ok) {
+        clearTracked('Pod 已删除,可重新创建');
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast(data.error || '删除失败', false);
+      }
+    } catch (err) {
+      toast('请求失败:' + err.message, false);
     }
   });
+
+  setView();
 })();
 </script>
 </body>

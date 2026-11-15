@@ -81,8 +81,8 @@ func (s *Sources) Start(ctx context.Context, store *Store, hub *Hub) {
 			if !ok || !isTrackedPod(pod) {
 				return
 			}
-			if st, cnt, changed := store.ApplyPod(pod); changed {
-				hub.PublishPodUpdate(st, cnt)
+			if st, changed := store.ApplyPod(pod); changed {
+				hub.PublishPodUpdate(st)
 			}
 		},
 		UpdateFunc: func(_, newObj interface{}) {
@@ -90,8 +90,8 @@ func (s *Sources) Start(ctx context.Context, store *Store, hub *Hub) {
 			if !ok || !isTrackedPod(pod) {
 				return
 			}
-			if st, cnt, changed := store.ApplyPod(pod); changed {
-				hub.PublishPodUpdate(st, cnt)
+			if st, changed := store.ApplyPod(pod); changed {
+				hub.PublishPodUpdate(st)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -102,8 +102,8 @@ func (s *Sources) Start(ctx context.Context, store *Store, hub *Hub) {
 			if !ok || !isTrackedPod(pod) {
 				return
 			}
-			if cnt, deleted := store.DeletePod(pod.Namespace, pod.Name); deleted {
-				hub.PublishPodDelete(pod.Namespace, pod.Name, cnt)
+			if store.DeletePod(pod.Namespace, pod.Name) {
+				hub.PublishPodDelete(pod.Namespace, pod.Name)
 			}
 		},
 	})
@@ -120,8 +120,9 @@ func (s *Sources) Start(ctx context.Context, store *Store, hub *Hub) {
 						return
 					}
 					if info, uid, ok := workloadFromUnstructured(u); ok {
-						if st, cnt, changed := store.ApplyWorkload(uid, info); changed {
-							hub.PublishPodUpdate(st, cnt)
+						if st, changed := store.ApplyWorkload(uid, info); changed {
+							hub.PublishPodUpdate(st)
+
 						}
 					}
 				},
@@ -131,25 +132,27 @@ func (s *Sources) Start(ctx context.Context, store *Store, hub *Hub) {
 						return
 					}
 					if info, uid, ok := workloadFromUnstructured(u); ok {
-						if st, cnt, changed := store.ApplyWorkload(uid, info); changed {
-							hub.PublishPodUpdate(st, cnt)
+						if st, changed := store.ApplyWorkload(uid, info); changed {
+							hub.PublishPodUpdate(st)
+
 						}
 					}
 				},
-				DeleteFunc: func(obj interface{}) {
-					if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-						obj = d.Obj
-					}
-					u, ok := obj.(*unstructured.Unstructured)
-					if !ok {
-						return
-					}
-					if _, uid, ok := workloadFromUnstructured(u); ok {
-						if st, cnt, changed := store.ApplyWorkload(uid, &WorkloadInfo{Name: u.GetName()}); changed {
-							hub.PublishPodUpdate(st, cnt)
-						}
-					}
-				},
+				// DeleteFunc: func(obj interface{}) {
+				// 	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				// 		obj = d.Obj
+				// 	}
+				// 	u, ok := obj.(*unstructured.Unstructured)
+				// 	if !ok {
+				// 		return
+				// 	}
+				// 	if _, uid, ok := workloadFromUnstructured(u); ok {
+				// 		if _, changed := store.ApplyWorkload(uid, &WorkloadInfo{Name: u.GetName()}); changed {
+				// 			//hub.PublishPodUpdate(st)
+				// 			return
+				// 		}
+				// 	}
+				// },
 			})
 		}
 	}
@@ -197,19 +200,19 @@ func workloadFromUnstructured(u *unstructured.Unstructured) (*WorkloadInfo, stri
 		info.Admitted = true
 		return info, podUID, true
 	}
-	if conds, ok, _ := unstructured.NestedSlice(u.Object, "status", "conditions"); ok {
-		for _, c := range conds {
-			m, ok := c.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			t, _, _ := unstructured.NestedString(m, "type")
-			st, _, _ := unstructured.NestedString(m, "status")
-			msg, _, _ := unstructured.NestedString(m, "message")
-			if t == "QuotaReserved" && st == "False" {
-				info.Message = msg
-			}
-		}
-	}
+	// if conds, ok, _ := unstructured.NestedSlice(u.Object, "status", "conditions"); ok {
+	// 	for _, c := range conds {
+	// 		m, ok := c.(map[string]interface{})
+	// 		if !ok {
+	// 			continue
+	// 		}
+	// 		t, _, _ := unstructured.NestedString(m, "type")
+	// 		st, _, _ := unstructured.NestedString(m, "status")
+	// 		msg, _, _ := unstructured.NestedString(m, "message")
+	// 		if t == "QuotaReserved" && st == "False" {
+	// 			info.Message = msg
+	// 		}
+	// 	}
+	// }
 	return info, podUID, true
 }

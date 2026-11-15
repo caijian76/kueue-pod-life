@@ -84,12 +84,9 @@ func (sim *Simulator) step(ctx context.Context) {
 	for i, p := range gated {
 		positions[p.Key()] = i
 	}
-	changed, counts, totalChanged := sim.store.ApplyQueuePositions(positions, len(gated))
+	changed := sim.store.ApplyQueuePositions(positions, len(gated))
 	for _, ps := range changed {
-		sim.hub.PublishPodUpdate(ps, counts)
-	}
-	if totalChanged && len(changed) == 0 {
-		sim.hub.PublishCounts(counts)
+		sim.hub.PublishPodUpdate(ps)
 	}
 	for _, p := range gated {
 		if running >= sim.slots {
@@ -119,16 +116,28 @@ func (sim *Simulator) step(ctx context.Context) {
 			}
 		}
 	}
+	for _, p := range list {
+		if p.Phase != PhaseRunning || !strings.HasSuffix(p.Image, ":crash") {
+			continue // 镜像 tag 为 crash 时模拟运行 5 秒后被 OOMKilled
+		}
+		base := p.StartedAt
+		if base == 0 {
+			base = p.CreatedAt
+		}
+		if time.Now().Unix()-base >= 5 {
+			sim.crashPod(ctx, p)
+		}
+	}
 }
 
 func (sim *Simulator) publishWorkload(p *PodState, admitted bool, msg string) {
-	if st, cnt, changed := sim.store.ApplyWorkloadByKey(p.Namespace, p.Name, &WorkloadInfo{
+	if st, changed := sim.store.ApplyWorkloadByKey(p.Namespace, p.Name, &WorkloadInfo{
 		Name:     wlNameFor(p.Name),
 		Queue:    p.Queue,
 		Admitted: admitted,
 		Message:  msg,
 	}); changed {
-		sim.hub.PublishPodUpdate(st, cnt)
+		sim.hub.PublishPodUpdate(st)
 	}
 }
 
@@ -221,5 +230,28 @@ func (sim *Simulator) startRunning(ctx context.Context, p *PodState) {
 	}}
 	if _, err := sim.client.CoreV1().Pods(p.Namespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
 		slog.Warn("mock start failed", "pod", p.Name, "err", err)
+	}
+}
+
+func (sim *Simulator) crashPod(ctx context.Context, p *PodState) {
+	pod, err := sim.client.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
+	if err != nil {
+		return
+	}
+	now := metav1.NewTime(time.Now())
+	pod.Status.Phase = corev1.PodFailed
+	if len(pod.Status.ContainerStatuses) > 0 {
+		pod.Status.ContainerStatuses[0].Ready = false
+		pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   137,
+				Reason:     "OOMKilled",
+				Message:    "container exceeded memory limit (simulated)",
+				FinishedAt: now,
+			},
+		}
+	}
+	if _, err := sim.client.CoreV1().Pods(p.Namespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		slog.Warn("mock crash failed", "pod", p.Name, "err", err)
 	}
 }

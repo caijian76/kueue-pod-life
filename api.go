@@ -4,13 +4,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
-	"net"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -39,59 +39,21 @@ type Server struct {
 
 	started       time.Time
 	globalLimiter *rate.Limiter
-	ipMu          sync.Mutex
-	ipLimiters    map[string]*ipLimiter
-}
-
-type ipLimiter struct {
-	lim  *rate.Limiter
-	last time.Time
 }
 
 func NewServer(cfg Config, store *Store, hub *Hub, src *Sources) *Server {
-	s := &Server{
+	return &Server{
 		cfg:           cfg,
 		store:         store,
 		hub:           hub,
 		src:           src,
 		started:       time.Now(),
 		globalLimiter: rate.NewLimiter(50, 100),
-		ipLimiters:    make(map[string]*ipLimiter),
-	}
-	go s.pruneIPLimiters()
-	return s
-}
-
-func (s *Server) pruneIPLimiters() {
-	for range time.Tick(10 * time.Minute) {
-		s.ipMu.Lock()
-		now := time.Now()
-		for k, v := range s.ipLimiters {
-			if now.Sub(v.last) > 10*time.Minute {
-				delete(s.ipLimiters, k)
-			}
-		}
-		s.ipMu.Unlock()
 	}
 }
 
-func (s *Server) allowCreate(remote string) bool {
-	if !s.globalLimiter.Allow() {
-		return false
-	}
-	ip, _, err := net.SplitHostPort(remote)
-	if err != nil || ip == "" {
-		ip = remote
-	}
-	s.ipMu.Lock()
-	defer s.ipMu.Unlock()
-	l, ok := s.ipLimiters[ip]
-	if !ok {
-		l = &ipLimiter{lim: rate.NewLimiter(2, 4)}
-		s.ipLimiters[ip] = l
-	}
-	l.last = time.Now()
-	return l.lim.Allow()
+func (s *Server) allowCreate() bool {
+	return s.globalLimiter.Allow()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -105,16 +67,18 @@ func httpError(w http.ResponseWriter, status int, msg string) {
 }
 
 type createReq struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Image     string `json:"image"`
-	CPU       string `json:"cpu"`
-	Memory    string `json:"memory"`
-	Queue     string `json:"queue"`
+	Name         string `json:"name"`
+	Namespace    string `json:"namespace"`
+	Image        string `json:"image"`
+	Command      string `json:"command"`
+	NodeSelector string `json:"nodeSelector"`
+	CPU          string `json:"cpu"`
+	Memory       string `json:"memory"`
+	Queue        string `json:"queue"`
 }
 
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
-	if !s.allowCreate(r.RemoteAddr) {
+	if !s.allowCreate() {
 		httpError(w, http.StatusTooManyRequests, "创建过于频繁,请稍后再试")
 		return
 	}
@@ -161,9 +125,28 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var args []string
+	if cmd := strings.TrimSpace(req.Command); cmd != "" {
+		if len(cmd) > 1024 {
+			httpError(w, http.StatusBadRequest, "启动命令过长(最长 1024 字符)")
+			return
+		}
+		args = splitCommand(cmd)
+		if len(args) == 0 {
+			httpError(w, http.StatusBadRequest, "启动命令不合法")
+			return
+		}
+	} // 留空则不设置 command,使用镜像默认入口
+
+	nodeSelector, err := parseNodeSelector(req.NodeSelector)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	cpuS := strings.TrimSpace(req.CPU)
 	if cpuS == "" {
-		cpuS = "100m"
+		cpuS = "1"
 	}
 	cpuQ, err := resource.ParseQuantity(cpuS)
 	if err != nil {
@@ -172,7 +155,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	memS := strings.TrimSpace(req.Memory)
 	if memS == "" {
-		memS = "64Mi"
+		memS = "1Gi"
 	}
 	memQ, err := resource.ParseQuantity(memS)
 	if err != nil {
@@ -180,7 +163,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pod := buildPod(name, ns, image, cpuQ, memQ, queue, s.cfg.Mock)
+	pod := buildPod(name, ns, image, cpuQ, memQ, queue, args, nodeSelector, s.cfg.Mock)
 	created, err := s.src.Client.CoreV1().Pods(ns).Create(r.Context(), pod, metav1.CreateOptions{})
 	if err != nil {
 		switch {
@@ -200,7 +183,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func buildPod(name, ns, image string, cpu, mem resource.Quantity, queue string, mock bool) *corev1.Pod {
+func buildPod(name, ns, image string, cpu, mem resource.Quantity, queue string, cmd []string, nodeSelector map[string]string, mock bool) *corev1.Pod {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              name,
@@ -212,12 +195,13 @@ func buildPod(name, ns, image string, cpu, mem resource.Quantity, queue string, 
 			},
 		},
 		Spec: corev1.PodSpec{
+			NodeSelector:                  nodeSelector,
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			TerminationGracePeriodSeconds: new(int64),
 			Containers: []corev1.Container{{
 				Name:            "main",
 				Image:           image,
-				Command:         []string{"sleep", "infinity"},
+				Command:         cmd,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -238,6 +222,69 @@ func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// splitCommand 按空白切分启动命令;单双引号包裹的含空格参数视为一个参数(引号被剥掉)。
+func splitCommand(s string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuote := rune(0)
+	for _, r := range s {
+		switch {
+		case inQuote != 0:
+			if r == inQuote {
+				inQuote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+		case r == '"' || r == '\'':
+			inQuote = r
+		case r == ' ' || r == '\t':
+			if cur.Len() > 0 {
+				args = append(args, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+var (
+	labelKeyRe   = regexp.MustCompile(`^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?(/[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?)?$`)
+	labelValueRe = regexp.MustCompile(`^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$`)
+)
+
+// parseNodeSelector 解析 "k1=v1,k2=v2" 格式的节点选择器,空串返回 nil。
+func parseNodeSelector(s string) (map[string]string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	if len(s) > 512 {
+		return nil, fmt.Errorf("节点选择器过长(最长 512 字符)")
+	}
+	m := make(map[string]string)
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(pair, "=")
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if !ok || k == "" || v == "" || !labelKeyRe.MatchString(k) || !labelValueRe.MatchString(v) {
+			return nil, fmt.Errorf("节点选择器格式不合法(应为 k1=v1,k2=v2):%s", pair)
+		}
+		m[k] = v
+	}
+	if len(m) == 0 {
+		return nil, nil
+	}
+	return m, nil
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -279,15 +326,24 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "SSE not supported")
 		return
 	}
+	// SSE 只提供按 Pod 过滤的订阅:每个前端连接只接收自己 Pod 的数据
+	ns, name, ok := strings.Cut(r.URL.Query().Get("pod"), "/")
+	if !ok || ns == "" || name == "" {
+		httpError(w, http.StatusBadRequest, "缺少 pod 参数,格式 namespace/name")
+		return
+	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("X-Accel-Buffering", "no")
 
-	id, ch := s.hub.Subscribe()
+	// 连接生命周期日志:配合前端指示器定位"事件停滞/频繁重连"发生在哪一层
+	slog.Info("SSE 订阅", "pod", ns+"/"+name, "remote", r.RemoteAddr)
+	defer slog.Info("SSE 断开", "pod", ns+"/"+name, "remote", r.RemoteAddr)
+	id, ch := s.hub.Subscribe(ns + "/" + name)
 	defer s.hub.Unsubscribe(id)
 
-	if _, err := w.Write(s.store.SnapshotJSON(s.cfg.MaxSnapshot)); err != nil {
+	if _, err := w.Write(s.store.SnapshotJSONFor(ns, name)); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -334,6 +390,10 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/pods/{namespace}/{name}", s.handleGet)
 	mux.HandleFunc("DELETE /api/pods/{namespace}/{name}", s.handleDelete)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
-	mux.Handle("GET /", http.FileServerFS(staticRoot()))
+	// no-store:前端随二进制嵌入更新,禁止浏览器沿用重启前缓存的旧页面/旧 JS
+	mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.FileServerFS(staticRoot()).ServeHTTP(w, r)
+	}))
 	return mux
 }
