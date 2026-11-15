@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kueue Pod 排队演示</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e;
+    --blue: #4493f8; --green: #3fb950; --red: #f85149;
+    --amber: #d29922; --purple: #ab7df8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 24px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: rgba(13,17,23,.92); backdrop-filter: blur(6px); z-index: 10;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .conn { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+  .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+  .chip {
+    padding: 3px 10px; border-radius: 12px; border: 1px solid var(--border);
+    background: var(--panel); font-size: 12.5px; color: var(--muted);
+  }
+  .chip b { color: var(--text); margin-left: 4px; }
+  .wrap { display: grid; grid-template-columns: 320px 1fr; gap: 20px; padding: 20px 24px; max-width: 1400px; }
+  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600; }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
+  input {
+    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font: inherit; outline: none;
+  }
+  input:focus { border-color: var(--blue); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button {
+    width: 100%; margin-top: 16px; padding: 9px; border: 0; border-radius: 6px;
+    background: #238636; color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .hint { margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .hint code { color: var(--purple); }
+  .toast {
+    margin-top: 12px; padding: 8px 10px; border-radius: 6px; font-size: 12.5px;
+    display: none; word-break: break-all;
+  }
+  .toast.err { display: block; background: rgba(248,81,73,.15); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+  .toast.ok { display: block; background: rgba(63,185,80,.15); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+  .pods { display: flex; flex-direction: column; gap: 10px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+  .pod { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
+  .pod-head { display: flex; align-items: center; gap: 10px; }
+  .pod-name { font-weight: 600; font-family: ui-monospace, monospace; }
+  .badge { font-size: 12px; padding: 2px 10px; border-radius: 10px; font-weight: 600; }
+  .badge.Queued   { color: var(--amber); background: rgba(210,153,34,.15); border: 1px solid rgba(210,153,34,.4); }
+  .badge.Admitted { color: var(--blue);  background: rgba(68,147,248,.15); border: 1px solid rgba(68,147,248,.4); }
+  .badge.Running  { color: var(--green); background: rgba(63,185,80,.15);  border: 1px solid rgba(63,185,80,.4); }
+  .badge.Succeeded{ color: var(--green); background: rgba(63,185,80,.15);  border: 1px solid rgba(63,185,80,.4); }
+  .badge.Failed   { color: var(--red);   background: rgba(248,81,73,.15);  border: 1px solid rgba(248,81,73,.4); }
+  .pos { color: var(--amber); font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .pod-meta { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; }
+  .del {
+    width: auto; margin: 0; padding: 2px 10px; font-size: 12px; font-weight: 500;
+    background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 6px;
+  }
+  .del:hover { color: var(--red); border-color: var(--red); background: transparent; }
+  .timeline { display: flex; align-items: flex-start; margin: 14px 0 4px; }
+  .step { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 0 0 auto; min-width: 64px; }
+  .step .pt {
+    width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border);
+    background: var(--panel);
+  }
+  .step .lb { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .step .ts { font-size: 10.5px; color: var(--muted); opacity: .7; font-family: ui-monospace, monospace; min-height: 13px; }
+  .step.done .pt { background: var(--blue); border-color: var(--blue); }
+  .step.done .lb { color: var(--text); }
+  .step.active .pt { background: var(--amber); border-color: var(--amber); animation: pulse 1.2s infinite; }
+  .step.active .lb { color: var(--amber); }
+  .step.ok .pt { background: var(--green); border-color: var(--green); }
+  .step.ok .lb { color: var(--green); }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(210,153,34,.2); } }
+  .link { flex: 1 1 auto; height: 2px; background: var(--border); margin: 5px 2px 0; min-width: 8px; }
+  .link.done { background: var(--blue); }
+  .msg {
+    margin-top: 8px; font-size: 12px; color: var(--amber);
+    background: rgba(210,153,34,.08); border: 1px solid rgba(210,153,34,.25);
+    padding: 5px 10px; border-radius: 6px; word-break: break-all;
+  }
+  .msg.err { color: var(--red); background: rgba(248,81,73,.08); border-color: rgba(248,81,73,.25); }
+  .pod-foot { margin-top: 8px; color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .pod-foot b { color: var(--text); font-weight: 500; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kueue Pod 排队演示</h1>
+  <div class="conn"><div class="dot" id="connDot"></div><span id="connText">连接中…</span></div>
+  <div class="chips">
+    <div class="chip">总计<b id="cTotal">0</b></div>
+    <div class="chip">排队<b id="cQueued">0</b></div>
+    <div class="chip">已准入<b id="cAdmitted">0</b></div>
+    <div class="chip">运行中<b id="cRunning">0</b></div>
+  </div>
+</header>
+
+<div class="wrap">
+  <aside class="panel">
+    <h2>创建 Pod</h2>
+    <form id="form">
+      <label for="name">Pod 名称(留空自动生成)</label>
+      <input id="name" placeholder="例如 web-demo-1" autocomplete="off" spellcheck="false">
+      <label for="image">镜像</label>
+      <input id="image" value="busybox:1.36" autocomplete="off" spellcheck="false">
+      <div class="grid2">
+        <div>
+          <label for="cpu">CPU 请求</label>
+          <input id="cpu" value="100m" autocomplete="off">
+        </div>
+        <div>
+          <label for="memory">内存请求</label>
+          <input id="memory" value="64Mi" autocomplete="off">
+        </div>
+      </div>
+      <div class="grid2">
+        <div>
+          <label for="queue">Kueue 队列</label>
+          <input id="queue" value="user-queue" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="namespace">命名空间</label>
+          <input id="namespace" value="default" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <button id="submit" type="submit">创建 Pod(经 Kueue 排队)</button>
+      <div class="toast" id="toast"></div>
+      <div class="hint">
+        提交后 Pod 带上 <code>kueue.x-k8s.io/queue-name</code> 标签,
+        以 <code>sleep infinity</code> 常驻运行,由 Kueue 排队准入;
+        状态通过 SSE 实时推送,无需轮询。
+      </div>
+    </form>
+  </aside>
+
+  <section>
+    <div class="pods" id="pods"><div class="empty">暂无 Pod,先创建一个试试</div></div>
+  </section>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const pods = new Map();        // key -> pod state
+  const rows = new Map();        // key -> element
+  let rafPending = false;
+  let queueTotal = 0;            // ClusterQueue 当前排队总数(来自 visibility 轮询)
+
+  const PHASE_TEXT = {
+    Queued: '排队中', Admitted: '已准入', Running: '运行中',
+    Succeeded: '成功', Failed: '失败',
+  };
+  const DETAIL_TEXT = { Scheduling: '调度中', Pulling: '拉取镜像', Creating: '创建容器' };
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  function toast(msg, ok) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + (ok ? 'ok' : 'err');
+    if (ok) setTimeout(() => { t.className = 'toast'; t.textContent = ''; }, 3000);
+  }
+
+  function setConn(on, text) {
+    $('connDot').className = 'dot' + (on ? ' on' : '');
+    $('connText').textContent = text;
+  }
+
+  function updateCounts(c) {
+    if (!c) return;
+    queueTotal = c.queueTotal ?? 0;
+    $('cTotal').textContent = c.total ?? 0;
+    $('cQueued').textContent = c.queued ?? 0;
+    $('cAdmitted').textContent = c.admitted ?? 0;
+    $('cRunning').textContent = c.running ?? 0;
+  }
+
+  // 每个节点状态:2=已完成 1=进行中 0=未开始 3=成功(生命周期到“运行中”为止)
+  function buildTimeline(p) {
+    const labels = ['已创建', '排队中', '已准入', '调度中', '拉取镜像', '创建容器', '运行中'];
+    const states = [2, 0, 0, 0, 0, 0, 0];
+    states[1] = p.phase === 'Queued' ? 1 : 2;
+    states[2] = p.phase === 'Queued' ? 0 : (p.phase === 'Admitted' && !p.detail ? 1 : 2);
+    if (p.phase === 'Admitted') {
+      const d = p.detail || '';
+      states[3] = d === 'Scheduling' ? 1 : (d ? 2 : 0);
+      states[4] = d === 'Pulling' ? 1 : (d === 'Creating' ? 2 : 0);
+      states[5] = d === 'Creating' ? 1 : 0;
+    } else if (p.phase !== 'Queued') {
+      states[3] = states[4] = states[5] = 2;
+      states[6] = 3;
+    }
+    const ts = [
+      p.createdAt,
+      p.createdAt,
+      p.admitted ? (p.startedAt || p.createdAt) : 0,
+      p.scheduledAt,
+      '',
+      '',
+      p.startedAt,
+    ];
+    const clsOf = s => s === 2 ? 'done' : s === 1 ? 'active' : s === 3 ? 'ok' : '';
+    let html = '';
+    for (let i = 0; i < labels.length; i++) {
+      const cls = clsOf(states[i]);
+      html += `<div class="step ${cls}"><div class="pt"></div><div class="lb">${labels[i]}</div>` +
+        `<div class="ts">${esc(fmtTime(ts[i]))}</div></div>`;
+      if (i < labels.length - 1) {
+        html += `<div class="link ${states[i + 1] > 0 ? 'done' : ''}"></div>`;
+      }
+    }
+    return html;
+  }
+
+  function rowHTML(p) {
+    const meta = [];
+    if (p.image) meta.push(`<span>镜像 <b>${esc(p.image)}</b></span>`);
+    if (p.cpu || p.memory) meta.push(`<span>资源 <b>${esc(p.cpu || '-')} / ${esc(p.memory || '-')}</b></span>`);
+    if (p.queue) meta.push(`<span>队列 <b>${esc(p.queue)}</b></span>`);
+    if (p.workload) meta.push(`<span>Workload <b>${esc(p.workload)}</b></span>`);
+    if (p.restarts) meta.push(`<span>重启 <b>${p.restarts}</b></span>`);
+    const msg = p.error ? `<div class="msg err">${esc(p.error)}</div>`
+      : p.message ? `<div class="msg">${esc(p.message)}</div>` : '';
+    return `
+      <div class="pod-head">
+        <span class="pod-name">${esc(p.name)}</span>
+        <span class="badge ${esc(p.error && p.phase === 'Admitted' ? 'Failed' : p.phase)}">${DETAIL_TEXT[p.detail] || PHASE_TEXT[p.phase] || esc(p.rawPhase || p.phase)}</span>
+        ${p.phase === 'Queued' && typeof p.queuePosition === 'number' && p.queuePosition >= 0
+          ? `<span class="pos">排队 ${p.queuePosition + 1}${queueTotal > 0 ? '/' + queueTotal : ''}</span>` : ''}
+        <span class="pod-meta">
+          <span>${esc(p.namespace)}</span>
+          <button class="del" data-del="${esc(p.namespace)}/${esc(p.name)}">删除</button>
+        </span>
+      </div>
+      <div class="timeline">${buildTimeline(p)}</div>
+      ${msg}
+      <div class="pod-foot">${meta.join('')}</div>`;
+  }
+
+  function sortedKeys() {
+    return [...pods.values()]
+      .sort((a, b) => (b.createdAt - a.createdAt) || (a.name < b.name ? 1 : -1))
+      .map(p => p.key);
+  }
+
+  function render() {
+    rafPending = false;
+    const container = $('pods');
+    for (const [k, el] of rows) {
+      if (!pods.has(k)) { el.remove(); rows.delete(k); }
+    }
+    const keys = sortedKeys();
+    if (!keys.length) {
+      if (!container.querySelector('.empty')) {
+        container.innerHTML = '<div class="empty">暂无 Pod,先创建一个试试</div>';
+      }
+      return;
+    }
+    const empty = container.querySelector('.empty');
+    if (empty) empty.remove();
+    let prev = null;
+    for (const k of keys) {
+      const p = pods.get(k);
+      let el = rows.get(k);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'pod';
+        rows.set(k, el);
+      }
+      el.innerHTML = rowHTML(p);
+      if (!prev) container.prepend(el);
+      else prev.after(el);
+      prev = el;
+    }
+  }
+
+  function scheduleRender() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(render);
+  }
+
+  const es = new EventSource('/api/events');
+  es.onopen = () => setConn(true, '已连接(实时推送)');
+  es.onerror = () => setConn(false, '重连中…');
+  es.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'init') {
+      pods.clear();
+      rows.forEach(el => el.remove());
+      rows.clear();
+      (m.pods || []).forEach(p => { p.key = p.namespace + '/' + p.name; pods.set(p.key, p); });
+      updateCounts(m.counts);
+    } else if (m.type === 'update') {
+      if (m.pod) {
+        m.pod.key = m.pod.namespace + '/' + m.pod.name;
+        pods.set(m.pod.key, m.pod);
+      }
+      updateCounts(m.counts);
+    } else if (m.type === 'counts') {
+      updateCounts(m.counts);
+    } else if (m.type === 'delete') {
+      pods.delete(m.namespace + '/' + m.name);
+      updateCounts(m.counts);
+    }
+    scheduleRender();
+  };
+
+  $('form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = $('submit');
+    btn.disabled = true;
+    try {
+      const body = {
+        name: $('name').value.trim(),
+        image: $('image').value.trim(),
+        cpu: $('cpu').value.trim(),
+        memory: $('memory').value.trim(),
+        queue: $('queue').value.trim(),
+        namespace: $('namespace').value.trim(),
+      };
+      const res = await fetch('/api/pods', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) toast(data.error || `创建失败(HTTP ${res.status})`, false);
+      else {
+        toast(`已提交:${data.namespace}/${data.name},进入队列 ${data.queue}`, true);
+        $('name').value = '';
+      }
+    } catch (err) {
+      toast('请求失败:' + err.message, false);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $('pods').addEventListener('click', async e => {
+    const btn = e.target.closest('[data-del]');
+    if (!btn) return;
+    const key = btn.getAttribute('data-del');
+    if (!confirm('删除 ' + key + ' ?')) return;
+    const [ns, name] = key.split('/');
+    const res = await fetch(`/api/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      toast(data.error || '删除失败', false);
+    }
+  });
+})();
+</script>
+</body>
+</html>

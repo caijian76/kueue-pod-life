@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-kueue-demo
+  namespace: pod-demo
+  labels:
+    app: pod-kueue-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pod-kueue-demo
+  template:
+    metadata:
+      labels:
+        app: pod-kueue-demo
+    spec:
+      serviceAccountName: pod-kueue-demo
+      containers:
+        - name: api
+          image: pod-kueue-demo:local
+          imagePullPolicy: IfNotPresent
+          args: ["-queue", "user-queue", "-namespace", "default"]
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-kueue-demo
+  namespace: pod-demo
+spec:
+  type: NodePort
+  selector:
+    app: pod-kueue-demo
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080
