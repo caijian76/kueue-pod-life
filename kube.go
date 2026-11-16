@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -198,21 +199,26 @@ func workloadFromUnstructured(u *unstructured.Unstructured) (*WorkloadInfo, stri
 	}
 	if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "status", "admission"); found {
 		info.Admitted = true
-		return info, podUID, true
 	}
-	// if conds, ok, _ := unstructured.NestedSlice(u.Object, "status", "conditions"); ok {
-	// 	for _, c := range conds {
-	// 		m, ok := c.(map[string]interface{})
-	// 		if !ok {
-	// 			continue
-	// 		}
-	// 		t, _, _ := unstructured.NestedString(m, "type")
-	// 		st, _, _ := unstructured.NestedString(m, "status")
-	// 		msg, _, _ := unstructured.NestedString(m, "message")
-	// 		if t == "QuotaReserved" && st == "False" {
-	// 			info.Message = msg
-	// 		}
-	// 	}
-	// }
+	// Admitted condition 的 lastTransitionTime 就是真实准入时间。
+	if conds, ok, _ := unstructured.NestedSlice(u.Object, "status", "conditions"); ok {
+		for _, c := range conds {
+			m, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			typ, _, _ := unstructured.NestedString(m, "type")
+			st, _, _ := unstructured.NestedString(m, "status")
+			if typ != "Admitted" || st != "True" {
+				continue
+			}
+			info.Admitted = true
+			if ts, _, _ := unstructured.NestedString(m, "lastTransitionTime"); ts != "" {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					info.AdmittedAt = t.Unix()
+				}
+			}
+		}
+	}
 	return info, podUID, true
 }

@@ -253,21 +253,23 @@
       states[3] = states[4] = states[5] = 2;
       states[6] = p.phase === 'Failed' || (p.phase === 'Running' && p.error) ? 4 : 3;
     }
+    // 每个节点显示的是该节点状态真正生效的时间(与点亮它的那次状态推送一致),
+    // 不能拿创建时间/启动时间去顶替准入、拉取镜像、创建容器的时间。
     const ts = [
       p.createdAt,
       p.createdAt,
-      p.admitted ? (p.startedAt || p.createdAt) : 0,
+      p.admittedAt,
       p.scheduledAt,
-      '',
-      '',
-      p.startedAt,
+      p.pullingAt,
+      p.creatingAt,
+      p.runningAt,
     ];
     const clsOf = s => s === 2 ? 'done' : s === 1 ? 'active' : s === 3 ? 'ok' : s === 4 ? 'err' : '';
     let html = '';
     for (let i = 0; i < labels.length; i++) {
       const cls = clsOf(states[i]);
       html += `<div class="step ${cls}"><div class="pt"></div><div class="lb">${labels[i]}</div>` +
-        `<div class="ts">${esc(fmtTime(ts[i]))}</div></div>`;
+        `<div class="ts">${states[i] > 0 ? esc(fmtTime(ts[i])) : ''}</div></div>`;
       if (i < labels.length - 1) {
         html += `<div class="link ${states[i + 1] > 0 ? 'done' : ''}"></div>`;
       }

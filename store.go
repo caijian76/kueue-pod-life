@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -20,10 +21,11 @@ const (
 )
 
 type WorkloadInfo struct {
-	Name     string `json:"name"`
-	Queue    string `json:"queue"`
-	Admitted bool   `json:"admitted"`
-	Message  string `json:"message,omitempty"`
+	Name       string `json:"name"`
+	Queue      string `json:"queue"`
+	Admitted   bool   `json:"admitted"`
+	AdmittedAt int64  `json:"admittedAt,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 // QueuePositionUnknown marks a queued pod whose position is not (yet) known.
@@ -47,8 +49,12 @@ type PodState struct {
 	QueuePosition int      `json:"queuePosition"`
 	Restarts      int32    `json:"restarts"`
 	CreatedAt     int64    `json:"createdAt"`
-	StartedAt     int64    `json:"startedAt,omitempty"`
+	AdmittedAt    int64    `json:"admittedAt,omitempty"`
 	ScheduledAt   int64    `json:"scheduledAt,omitempty"`
+	PullingAt     int64    `json:"pullingAt,omitempty"`
+	CreatingAt    int64    `json:"creatingAt,omitempty"`
+	StartedAt     int64    `json:"startedAt,omitempty"`
+	RunningAt     int64    `json:"runningAt,omitempty"`
 	UID           string   `json:"-"`
 }
 
@@ -114,6 +120,9 @@ func deriveState(pod *corev1.Pod, wl *WorkloadInfo) *PodState {
 	if wl != nil {
 		s.Workload = wl.Name
 		s.Queue = wl.Queue
+		if wl.Admitted {
+			s.AdmittedAt = wl.AdmittedAt
+		}
 	}
 	if len(pod.Spec.Containers) > 0 {
 		c := pod.Spec.Containers[0]
@@ -124,7 +133,15 @@ func deriveState(pod *corev1.Pod, wl *WorkloadInfo) *PodState {
 		}
 	}
 	if len(pod.Status.ContainerStatuses) > 0 {
-		s.Restarts = pod.Status.ContainerStatuses[0].RestartCount
+		cs := pod.Status.ContainerStatuses[0]
+		s.Restarts = cs.RestartCount
+		// Pod.Status.StartTime 是 kubelet 受理 Pod 的时间(拉镜像之前),
+		// 时间轴的"运行中"要用容器真正的启动时间。
+		if cs.State.Running != nil && !cs.State.Running.StartedAt.IsZero() {
+			s.RunningAt = cs.State.Running.StartedAt.Unix()
+		} else if cs.State.Terminated != nil && !cs.State.Terminated.StartedAt.IsZero() {
+			s.RunningAt = cs.State.Terminated.StartedAt.Unix()
+		}
 	}
 	switch pod.Status.Phase {
 	case corev1.PodSucceeded:
@@ -153,6 +170,65 @@ func deriveState(pod *corev1.Pod, wl *WorkloadInfo) *PodState {
 		s.Message = wl.Message
 	}
 	return s
+}
+
+// stampTransitions 补全时间轴各节点的时间戳。Kubernetes 只直接给出创建、
+// 调度、容器启动时间;准入时间取自 Workload 的 Admitted condition,拉取镜像/
+// 创建容器取首次观察到对应子状态的时刻。时间戳在同一份状态里打上,保证前端
+// 节点点亮和显示的时间来自同一次状态推送。
+func stampTransitions(next, old *PodState) {
+	if old != nil {
+		if next.AdmittedAt == 0 {
+			next.AdmittedAt = old.AdmittedAt
+		}
+		if next.ScheduledAt == 0 {
+			next.ScheduledAt = old.ScheduledAt
+		}
+		if next.PullingAt == 0 {
+			next.PullingAt = old.PullingAt
+		}
+		if next.CreatingAt == 0 {
+			next.CreatingAt = old.CreatingAt
+		}
+		if next.RunningAt == 0 {
+			next.RunningAt = old.RunningAt
+		}
+	}
+	now := time.Now().Unix()
+	if next.Admitted && next.AdmittedAt == 0 {
+		next.AdmittedAt = now
+	}
+	switch next.Detail {
+	case "Pulling":
+		if next.PullingAt == 0 {
+			next.PullingAt = now
+		}
+	case "Creating":
+		if next.PullingAt == 0 {
+			next.PullingAt = next.ScheduledAt
+			if next.PullingAt == 0 {
+				next.PullingAt = now
+			}
+		}
+		if next.CreatingAt == 0 {
+			next.CreatingAt = now
+		}
+	}
+	if next.Phase == PhaseRunning || next.Phase == PhaseSucceeded || next.Phase == PhaseFailed {
+		// 观察粒度太粗(如直接 Pulling → Running)时没看到拉取/创建子状态,
+		// 用已知的边界时间兜底,避免时间轴节点亮着却没有时间。
+		// 注意:容器创建完成于容器启动之前,创建时间不能回退成拉取开始时间,
+		// 否则长时间拉镜像后会显示"创建容器"和"拉取镜像"同时发生。
+		if next.PullingAt == 0 {
+			next.PullingAt = next.ScheduledAt
+		}
+		if next.RunningAt == 0 {
+			next.RunningAt = now
+		}
+		if next.CreatingAt == 0 {
+			next.CreatingAt = next.RunningAt
+		}
+	}
 }
 
 // pendingDetail 精化"已准入"阶段的子状态:调度中 → 拉取镜像 → 创建容器。
@@ -244,18 +320,23 @@ func (st *Store) ApplyPod(pod *corev1.Pod) (*PodState, bool) {
 	if pod.UID != "" {
 		st.uidMap[string(pod.UID)] = key
 	}
+	old := st.pods[key]
 	var wl *WorkloadInfo
-	if old, ok := st.pods[key]; ok && old.Workload != "" {
-		wl = &WorkloadInfo{Name: old.Workload, Queue: old.Queue, Admitted: old.Admitted, Message: old.Message}
+	if old != nil && old.Workload != "" {
+		wl = &WorkloadInfo{
+			Name: old.Workload, Queue: old.Queue, Admitted: old.Admitted,
+			AdmittedAt: old.AdmittedAt, Message: old.Message,
+		}
 	}
 
 	next := deriveState(pod, wl)
+	stampTransitions(next, old)
 	if next.Phase != PhaseQueued {
 		next.QueuePosition = QueuePositionUnknown
-	} else if old, ok := st.pods[key]; ok && old.QueuePosition != QueuePositionUnknown {
+	} else if old != nil && old.QueuePosition != QueuePositionUnknown {
 		next.QueuePosition = old.QueuePosition
 	}
-	if old, existed := st.pods[key]; existed && *old == *next {
+	if old != nil && *old == *next {
 		return nil, false
 	}
 	st.pods[key] = next
@@ -287,6 +368,9 @@ func (st *Store) applyWorkloadLocked(key string, info *WorkloadInfo) (*PodState,
 	next.Workload = info.Name
 	next.Queue = info.Queue
 	next.Admitted = info.Admitted
+	if info.AdmittedAt > 0 {
+		next.AdmittedAt = info.AdmittedAt
+	}
 	if old.Phase != PhaseRunning && old.Phase != PhaseSucceeded && old.Phase != PhaseFailed {
 		if old.Gated || !info.Admitted {
 			next.Phase = PhaseQueued
@@ -302,6 +386,7 @@ func (st *Store) applyWorkloadLocked(key string, info *WorkloadInfo) (*PodState,
 	if next.Phase != PhaseQueued {
 		next.QueuePosition = QueuePositionUnknown
 	}
+	stampTransitions(&next, old)
 	if *old == next {
 		return nil, false
 	}
